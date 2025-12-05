@@ -258,7 +258,7 @@ class GP(nn.Module):
         K_yx = K_xy.permute(0, 2, 1)
         sigma_noise = self.sigma_noise * torch.eye(h2 * w2, device=x.device)[None, :, :]
         with warnings.catch_warnings():
-            K_yy_inv = torch.linalg.inv(K_yy + sigma_noise)
+            K_yy_inv = torch.linalg.inv(K_yy + sigma_noise)#.double()
 
         mu_x = K_xy.matmul(K_yy_inv.matmul(f))
         mu_x = rearrange(mu_x, "b (h w) d -> b d h w", h=h1, w=w1)
@@ -276,7 +276,7 @@ class Decoder(nn.Module):
     def __init__(
         self, embedding_decoder, gps, proj, conv_refiner, detach=False, scales="all", pos_embeddings = None,
         num_refinement_steps_per_scale = 1, warp_noise_std = 0.0, displacement_dropout_p = 0.0, gm_warp_dropout_p = 0.0,
-        flow_upsample_mode = "bilinear", amp_dtype = torch.float16,
+        flow_upsample_mode = "bilinear", amp_dtype = torch.float16, upsample_scales=["8", "4", "2", "1"]
     ):
         super().__init__()
         self.embedding_decoder = embedding_decoder
@@ -299,6 +299,7 @@ class Decoder(nn.Module):
         self.gm_warp_dropout_p = gm_warp_dropout_p
         self.flow_upsample_mode = flow_upsample_mode
         self.amp_dtype = amp_dtype
+        self.upsample_scales = upsample_scales
         
     def get_placeholder_flow(self, b, h, w, device):
         coarse_coords = torch.meshgrid(
@@ -332,7 +333,7 @@ class Decoder(nn.Module):
 
     def forward(self, f1, f2, gt_warp = None, gt_prob = None, upsample = False, flow = None, certainty = None, scale_factor = 1):
         coarse_scales = self.embedding_decoder.scales()
-        all_scales = self.scales if not upsample else ["8", "4", "2", "1"] 
+        all_scales = self.scales if not upsample else self.upsample_scales
         sizes = {scale: f1[scale].shape[-2:] for scale in f1}
         h, w = sizes[1]
         b = f1[1].shape[0]
@@ -450,6 +451,7 @@ class RegressionMatcher(nn.Module):
         self.sample_thresh = 0.05
             
     def get_output_resolution(self):
+        assert self.decoder.upsample_scales == ["8", "4", "2", "1"], "get_output_resolution only works when upsample_scales is ['8','4','2','1']"
         if not self.upsample_preds:
             return self.h_resized, self.w_resized
         else:
@@ -510,15 +512,14 @@ class RegressionMatcher(nn.Module):
                                 upsample = upsample, 
                                 **(batch["corresps"] if "corresps" in batch else {}),
                                 scale_factor=scale_factor)
-        
         return corresps
 
     def forward_symmetric(self, batch, batched = True, upsample = False, scale_factor = 1):
         feature_pyramid = self.extract_backbone_features(batch, batched = batched, upsample = upsample)
-        f_q_pyramid = feature_pyramid
+        f_q_pyramid = feature_pyramid #2*n_pair, c, h, w (A,B)
         f_s_pyramid = {
             scale: torch.cat((f_scale.chunk(2)[1], f_scale.chunk(2)[0]), dim = 0)
-            for scale, f_scale in feature_pyramid.items()
+            for scale, f_scale in feature_pyramid.items() ##2*n_pair, c, h, w (B,A)
         }
         corresps = self.decoder(f_q_pyramid, 
                                 f_s_pyramid, 
@@ -620,11 +621,22 @@ class RegressionMatcher(nn.Module):
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+        def preprocess_tensor(im, hs, ws):
+            im1 = F.interpolate(im, size=(hs, ws), mode = 'bicubic')
+            mean=[0.485, 0.456, 0.406]
+            std=[0.229, 0.224, 0.225]
+            im2 = (im1 - torch.tensor(mean, device=im.device)[None, :, None, None]) / torch.tensor(std, device=im.device)[None, :, None, None]
+            return im2
+
         # Check if inputs are file paths or already loaded images
         if isinstance(im_A_input, (str, os.PathLike)):
             im_A = Image.open(im_A_input)
             check_not_i16(im_A)
             im_A = im_A.convert("RGB")
+        elif isinstance(im_A_input, torch.Tensor): 
+            assert batched and im_A_input.ndim == 4, "For tensor input, batched must be True and input must be 4D"
+            #[0,1] B,C,H,W
+            im_A = preprocess_tensor(im_A_input, self.h_resized, self.w_resized)
         else:
             check_rgb(im_A_input)
             im_A = im_A_input
@@ -633,6 +645,10 @@ class RegressionMatcher(nn.Module):
             im_B = Image.open(im_B_input)
             check_not_i16(im_B)
             im_B = im_B.convert("RGB")
+        elif isinstance(im_B_input, torch.Tensor):
+            assert batched and im_B_input.ndim == 4, "For tensor input, batched must be True and input must be 4D"
+            #[0,1] B,C,H,W
+            im_B = preprocess_tensor(im_B_input, self.h_resized, self.w_resized)
         else:
             check_rgb(im_B_input)
             im_B = im_B_input
@@ -661,26 +677,29 @@ class RegressionMatcher(nn.Module):
                 if h != self.h_resized or self.w_resized != w:
                     warn("Model resolution and batch resolution differ, may produce unexpected results")
                 hs, ws = h, w
-            finest_scale = 1
+            finest_scale = int(self.decoder.scales[-1])
             # Run matcher
             if symmetric:
-                corresps = self.forward_symmetric(batch)
+                lr_corresps = self.forward_symmetric(batch)
             else:
-                corresps = self.forward(batch, batched=True)
+                lr_corresps = self.forward(batch, batched=True)
 
             if self.upsample_preds:
                 hs, ws = self.upsample_res
 
+            '''
+            Move below
             if self.attenuate_cert:
                 low_res_certainty = F.interpolate(
-                    corresps[16]["certainty"], size=(hs, ws), align_corners=False, mode="bilinear"
+                    lr_corresps[16]["certainty"], size=(hs, ws), align_corners=False, mode="bilinear"
                 )
                 cert_clamp = 0
                 factor = 0.5
                 low_res_certainty = factor * low_res_certainty * (low_res_certainty < cert_clamp)
+            '''
 
             if self.upsample_preds:
-                finest_corresps = corresps[finest_scale]
+                finest_corresps = lr_corresps[finest_scale]
                 torch.cuda.empty_cache()
                 test_transform = get_tuple_transform_ops(
                     resize=(hs, ws), normalize=True
@@ -688,20 +707,31 @@ class RegressionMatcher(nn.Module):
                 if isinstance(im_A_input, (str, os.PathLike)):
                     im_A, im_B = test_transform(
                         (Image.open(im_A_input).convert('RGB'), Image.open(im_B_input).convert('RGB')))
+                    im_A, im_B = im_A[None].to(device), im_B[None].to(device)
+                elif isinstance(im_A_input, torch.Tensor):
+                    im_A, im_B = preprocess_tensor(im_A_input, hs, ws), preprocess_tensor(im_B_input, hs, ws)
                 else:
                     im_A, im_B = test_transform((im_A_input, im_B_input))
+                    im_A, im_B = im_A[None].to(device), im_B[None].to(device)
 
-                im_A, im_B = im_A[None].to(device), im_B[None].to(device)
                 scale_factor = math.sqrt(self.upsample_res[0] * self.upsample_res[1] / (self.w_resized * self.h_resized))
                 batch = {"im_A": im_A, "im_B": im_B, "corresps": finest_corresps}
                 if symmetric:
                     corresps = self.forward_symmetric(batch, upsample=True, batched=True, scale_factor=scale_factor)
                 else:
                     corresps = self.forward(batch, batched=True, upsample=True, scale_factor=scale_factor)
-
-            im_A_to_im_B = corresps[finest_scale]["flow"]
-            certainty = corresps[finest_scale]["certainty"] - (low_res_certainty if self.attenuate_cert else 0)
-            if finest_scale != 1:
+            finest_upsample_scale = int(self.decoder.upsample_scales[-1]) if self.upsample_preds else finest_scale
+            im_A_to_im_B = corresps[finest_upsample_scale]["flow"]
+            if self.attenuate_cert:
+                hs_, ws_ = im_A_to_im_B.shape[-2:]
+                low_res_certainty = F.interpolate(
+                    lr_corresps[16]["certainty"], size=(hs_, ws_), align_corners=False, mode="bilinear"
+                )
+                cert_clamp = 0
+                factor = 0.5
+                low_res_certainty = factor * low_res_certainty * (low_res_certainty < cert_clamp)
+            certainty = corresps[finest_upsample_scale]["certainty"] - (low_res_certainty if self.attenuate_cert else 0)
+            if finest_upsample_scale != 1:
                 im_A_to_im_B = F.interpolate(
                     im_A_to_im_B, size=(hs, ws), align_corners=False, mode="bilinear"
                 )
